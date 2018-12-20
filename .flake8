@@ -1,0 +1,5 @@
+[flake8]
+ignore = E501, F401, F821, F405, F403
+
+[pycodestyle]
+max_line_length = 120
