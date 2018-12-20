@@ -20,7 +20,6 @@ from dataset import DepthDataset
 
 
 class ResNet50(chainer.Chain):
-
     def __init__(self, **kwargs):
         super(ResNet50, self).__init__()
         with self.init_scope():
@@ -73,6 +72,81 @@ class RefinedNetwork(chainer.Chain):
         chainer.reporter.report({'loss': self.loss}, self)
         return h
 
+class UNET(chainer.Chain):
+
+    def __init__(self):
+        super(UNET, self).__init__()
+        with self.init_scope():
+            self.c0 = L.Convolution2D(3, 32, 3, 1, 1)
+            self.c1 = L.Convolution2D(32, 64, 4, 2, 1)
+            self.c2 = L.Convolution2D(64, 64, 3, 1, 1)
+            self.c3 = L.Convolution2D(64, 128, 4, 2, 1)
+            self.c4 = L.Convolution2D(128, 128, 3, 1, 1)
+            self.c5 = L.Convolution2D(128, 256, 4, 2, 1)
+            self.c6 = L.Convolution2D(256, 256, 3, 1, 1)
+            self.c7 = L.Convolution2D(256, 512, 4, 2, 1)
+            self.c8 = L.Convolution2D(512, 512, 3, 1, 1)
+
+            self.dc8  = L.Deconvolution2D(1024, 512, 4, 2, 1)
+            self.dc7  = L.Convolution2D(512, 256, 3, 1, 1)
+            self.dc6  = L.Deconvolution2D(512, 256, 4, 2, 1)
+            self.dc5  = L.Convolution2D(256, 128, 3, 1, 1)
+            self.dc4  = L.Deconvolution2D(256, 128, 4, 2, 1)
+            self.dc3  = L.Convolution2D(128, 64, 3, 1, 1)
+            self.dc2  = L.Deconvolution2D(128, 64, 4, 2, 1)
+            self.dc1  = L.Convolution2D(64, 32, 3, 1, 1)
+            self.dc0  = L.Convolution2D(64, 3, 3, 1, 1)
+            self.final = L.Convolution2D(3, 1, 1)
+
+            self.bnc0 = L.BatchNormalization(32)
+            self.bnc1 = L.BatchNormalization(64)
+            self.bnc2 = L.BatchNormalization(64)
+            self.bnc3 = L.BatchNormalization(128)
+            self.bnc4 = L.BatchNormalization(128)
+            self.bnc5 = L.BatchNormalization(256)
+            self.bnc6 = L.BatchNormalization(256)
+            self.bnc7 = L.BatchNormalization(512)
+            self.bnc8 = L.BatchNormalization(512)
+
+            self.bnd8 = L.BatchNormalization(512)
+            self.bnd7 = L.BatchNormalization(256)
+            self.bnd6 = L.BatchNormalization(256)
+            self.bnd5 = L.BatchNormalization(128)
+            self.bnd4 = L.BatchNormalization(128)
+            self.bnd3 = L.BatchNormalization(64)
+            self.bnd2 = L.BatchNormalization(64)
+            self.bnd1 = L.BatchNormalization(32)
+
+
+    def forward(self, x):
+        e0 = F.relu(self.bnc0(self.c0(x)))
+        e1 = F.relu(self.bnc1(self.c1(e0)))
+        e2 = F.relu(self.bnc2(self.c2(e1)))
+        e3 = F.relu(self.bnc3(self.c3(e2)))
+        e4 = F.relu(self.bnc4(self.c4(e3)))
+        e5 = F.relu(self.bnc5(self.c5(e4)))
+        e6 = F.relu(self.bnc6(self.c6(e5)))
+        e7 = F.relu(self.bnc7(self.c7(e6)))
+        e8 = F.relu(self.bnc8(self.c8(e7)))
+
+        d8 = F.relu(self.bnd8(self.dc8(F.concat([e7, e8]))))
+        d7 = F.relu(self.bnd7(self.dc7(d8)))
+        d6 = F.relu(self.bnd6(self.dc6(F.concat([e6, d7]))))
+        d5 = F.relu(self.bnd5(self.dc5(d6)))
+        d4 = F.relu(self.bnd4(self.dc4(F.concat([e4, d5]))))
+        d3 = F.relu(self.bnd3(self.dc3(d4)))
+        d2 = F.relu(self.bnd2(self.dc2(F.concat([e2, d3]))))
+        d1 = F.relu(self.bnd1(self.dc1(d2)))
+        d0 = self.dc0(F.concat([e0, d1]))
+        return F.sigmoid(self.final(d0))
+
+    def __call__(self, x, t):
+        h = self.forward(x)
+        loss = F.mean_squared_error(h, t)
+        self.loss = loss
+        chainer.reporter.report({'loss': self.loss}, self)
+        return loss
+
 
 def save_args(args):
     if not os.path.exists(args.destination):
@@ -91,7 +165,7 @@ def parse_argument():
     parser.add_argument("--device", type=int, default=7, help='%(default)s')
     parser.add_argument("--model_name", type=str, default="resnet50", help='model arch for training simple cnn, resnet50 or vgg16 default = %(default)s')
     parser.add_argument("--multiplier", type=float, default=1.0, help='%(default)s')
-    parser.add_argument("--batch-size", type=int, default=64, help='%(default)s')
+    parser.add_argument("--batch-size", type=int, default=16, help='%(default)s')
     parser.add_argument("--destination", type=str, default="trained", help='%(default)s')
     parser.add_argument("--resume", type=str, default="", help="default is empty string '' ")
     parser.add_argument("--epoch", type=int, default=100, help='num epoch for training %(default)s')
@@ -99,14 +173,20 @@ def parse_argument():
     return args
 
 
-def train(args=None):
-    dataset = DepthDataset('./', augmentation=True)
-    train, test = split_dataset_random(dataset, int(0.9 * len(dataset)), seed=args.seed)
 
+
+def train(args=None):
     if args.model_name == 'resnet50':
         model = RefinedNetwork(ResNet50)
+        resize = True
+    elif args.model_name == 'unet':
+        model = UNET()
+        resize = False
     else:
         assert False
+
+    dataset = DepthDataset('./', resize=resize, augmentation=True, pca_lighting=True, crop=True)
+    train, test = split_dataset_random(dataset, int(0.9 * len(dataset)), seed=args.seed)
 
     train_iter = chainer.iterators.MultiprocessIterator(train, args.batch_size, n_processes=4)
     test_iter = chainer.iterators.MultiprocessIterator(
@@ -116,7 +196,6 @@ def train(args=None):
     opt.setup(model)
 
     updater = training.StandardUpdater(train_iter, opt, device=args.device)
-
     trainer = training.Trainer(updater, (args.epoch, 'epoch'), out='./result')
 
     snapshot_interval = (1, 'epoch')
