@@ -2,13 +2,17 @@ import os
 import argparse
 import random
 import json
+import copy
 
+import scipy
 import chainer
 from chainer import training
 from chainer.training import extensions
 from chainer import functions as F
 from chainer import links as L
 from chainer.datasets import split_dataset_random
+import chainercv
+from chainercv import transforms
 
 import numpy as np
 try:
@@ -45,6 +49,28 @@ class ResNet50(chainer.Chain):
             self.base[layer].disable_update()
 
 
+class Conv(chainer.Chain):
+    def __init__(self, n_in, n_out, ksize, stride, pad):
+        super(Conv, self).__init__()
+        with self.init_scope():
+            self.conv = L.Convolution2D(n_in, n_out, ksize, stride, pad)
+            self.bn = L.BatchNormalization(n_out)
+
+    def __call__(self, x):
+        return F.relu(self.bn(self.conv(x)))
+
+
+class Deconv(chainer.Chain):
+    def __init__(self, n_in, n_out, ksize, stride, pad):
+        super(Deconv, self).__init__()
+        with self.init_scope():
+            self.conv = L.Deconvolution2D(n_in, n_out, ksize, stride, pad)
+            self.bn = L.BatchNormalization(n_out)
+
+    def __call__(self, x):
+        return F.relu(self.bn(self.conv(x)))
+
+
 class RefinedNetwork(chainer.Chain):
 
     def __init__(self, f):
@@ -59,7 +85,7 @@ class RefinedNetwork(chainer.Chain):
         batch_size = x.shape[0]
         fine1 = F.max_pooling_2d(self.fine1(x), 3, stride=1, pad=1)
         coarse = self.coarse(x)
-        reshape = F.reshape(coarse, (batch_size, 1, 128, 128))
+        reshape = F.reshape(coarse, (batch_size, 1, 240, 320))
         fine2 = F.concat((fine1, reshape), axis=1)
         fine3 = self.fine3(fine2)
         return F.sigmoid(self.fine4(fine3))
@@ -72,73 +98,56 @@ class RefinedNetwork(chainer.Chain):
         chainer.reporter.report({'loss': self.loss}, self)
         return h
 
+
 class UNET(chainer.Chain):
 
     def __init__(self):
         super(UNET, self).__init__()
         with self.init_scope():
-            self.c0 = L.Convolution2D(3, 32, 3, 1, 1)
-            self.c1 = L.Convolution2D(32, 64, 4, 2, 1)
-            self.c2 = L.Convolution2D(64, 64, 3, 1, 1)
-            self.c3 = L.Convolution2D(64, 128, 4, 2, 1)
-            self.c4 = L.Convolution2D(128, 128, 3, 1, 1)
-            self.c5 = L.Convolution2D(128, 256, 4, 2, 1)
-            self.c6 = L.Convolution2D(256, 256, 3, 1, 1)
-            self.c7 = L.Convolution2D(256, 512, 4, 2, 1)
-            self.c8 = L.Convolution2D(512, 512, 3, 1, 1)
+            rate = 4
+            self.c0 = Conv(3, 8 * rate, 3, 1, 1)
+            self.c1 = Conv(None, 16 * rate, 4, 2, 1)
+            self.c2 = Conv(None, 16 * rate, 3, 1, 1)
+            self.c3 = Conv(None, 32 * rate, 4, 2, 1)
+            self.c4 = Conv(None, 32 * rate, 3, 1, 1)
+            self.c5 = Conv(None, 64 * rate, 4, 2, 1)
+            self.c6 = Conv(None, 64 * rate, 3, 1, 1)
+            self.c7 = Conv(None, 128 * rate, 4, 2, 1)
+            self.c8 = Conv(None, 128 * rate, 3, 1, 1)
 
-            self.dc8  = L.Deconvolution2D(1024, 512, 4, 2, 1)
-            self.dc7  = L.Convolution2D(512, 256, 3, 1, 1)
-            self.dc6  = L.Deconvolution2D(512, 256, 4, 2, 1)
-            self.dc5  = L.Convolution2D(256, 128, 3, 1, 1)
-            self.dc4  = L.Deconvolution2D(256, 128, 4, 2, 1)
-            self.dc3  = L.Convolution2D(128, 64, 3, 1, 1)
-            self.dc2  = L.Deconvolution2D(128, 64, 4, 2, 1)
-            self.dc1  = L.Convolution2D(64, 32, 3, 1, 1)
-            self.dc0  = L.Convolution2D(64, 3, 3, 1, 1)
-            self.final = L.Convolution2D(3, 1, 1)
-
-            self.bnc0 = L.BatchNormalization(32)
-            self.bnc1 = L.BatchNormalization(64)
-            self.bnc2 = L.BatchNormalization(64)
-            self.bnc3 = L.BatchNormalization(128)
-            self.bnc4 = L.BatchNormalization(128)
-            self.bnc5 = L.BatchNormalization(256)
-            self.bnc6 = L.BatchNormalization(256)
-            self.bnc7 = L.BatchNormalization(512)
-            self.bnc8 = L.BatchNormalization(512)
-
-            self.bnd8 = L.BatchNormalization(512)
-            self.bnd7 = L.BatchNormalization(256)
-            self.bnd6 = L.BatchNormalization(256)
-            self.bnd5 = L.BatchNormalization(128)
-            self.bnd4 = L.BatchNormalization(128)
-            self.bnd3 = L.BatchNormalization(64)
-            self.bnd2 = L.BatchNormalization(64)
-            self.bnd1 = L.BatchNormalization(32)
-
+            self.dc8 = Deconv(1024, 512, 4, 2, 1)
+            self.dc7 = Conv(None, 256, 3, 1, 1)
+            self.dc6 = Deconv(None, 256, 4, 2, 1)
+            self.dc5 = Conv(None, 128, 3, 1, 1)
+            self.dc4 = Deconv(None, 128, 4, 2, 1)
+            self.dc3 = Conv(None, 64, 3, 1, 1)
+            self.dc2 = Deconv(None, 64, 4, 2, 1)
+            self.dc1 = Conv(None, 32, 3, 1, 1)
+            self.dc0 = Conv(None, 3, 3, 1, 1)
+            self.final = L.Convolution2D(None, 1, 1)
 
     def forward(self, x):
-        e0 = F.relu(self.bnc0(self.c0(x)))
-        e1 = F.relu(self.bnc1(self.c1(e0)))
-        e2 = F.relu(self.bnc2(self.c2(e1)))
-        e3 = F.relu(self.bnc3(self.c3(e2)))
-        e4 = F.relu(self.bnc4(self.c4(e3)))
-        e5 = F.relu(self.bnc5(self.c5(e4)))
-        e6 = F.relu(self.bnc6(self.c6(e5)))
-        e7 = F.relu(self.bnc7(self.c7(e6)))
-        e8 = F.relu(self.bnc8(self.c8(e7)))
+        e0 = self.c0(x)
+        e1 = self.c1(e0)
+        e2 = self.c2(e1)
+        e3 = self.c3(e2)
+        e4 = self.c4(e3)
+        e5 = self.c5(e4)
+        e6 = self.c6(e5)
+        e7 = self.c7(e6)
+        e8 = self.c8(e7)
 
-        d8 = F.relu(self.bnd8(self.dc8(F.concat([e7, e8]))))
-        d7 = F.relu(self.bnd7(self.dc7(d8)))
-        d6 = F.relu(self.bnd6(self.dc6(F.concat([e6, d7]))))
-        d5 = F.relu(self.bnd5(self.dc5(d6)))
-        d4 = F.relu(self.bnd4(self.dc4(F.concat([e4, d5]))))
-        d3 = F.relu(self.bnd3(self.dc3(d4)))
-        d2 = F.relu(self.bnd2(self.dc2(F.concat([e2, d3]))))
-        d1 = F.relu(self.bnd1(self.dc1(d2)))
+        d8 = self.dc8(F.concat([e7, e8]))
+        d7 = self.dc7(d8)
+        d6 = self.dc6(F.concat([e6, d7]))
+        d5 = self.dc5(d6)
+        d4 = self.dc4(F.concat([e4, d5]))
+        d3 = self.dc3(d4)
+        d2 = self.dc2(F.concat([e2, d3]))
+        d1 = self.dc1(d2)
         d0 = self.dc0(F.concat([e0, d1]))
-        return F.sigmoid(self.final(d0))
+        final = F.sigmoid(self.final(d0))
+        return final
 
     def __call__(self, x, t):
         h = self.forward(x)
@@ -159,34 +168,92 @@ def save_args(args):
         json.dump(vars(args), f)
 
 
+def parse_bool(s: str) -> bool:
+    if s == 'True' or 'true' or '1':
+        return True
+    elif s == 'False' or 'false' or '0':
+        return False
+    else:
+        raise Exception('cannot parse: {}'.format(s))
+
+
 def parse_argument():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=12345, help='seed for numpy cupy random module %(default)s')
     parser.add_argument("--device", type=int, default=7, help='%(default)s')
     parser.add_argument("--model_name", type=str, default="resnet50", help='model arch for training simple cnn, resnet50 or vgg16 default = %(default)s')
-    parser.add_argument("--multiplier", type=float, default=1.0, help='%(default)s')
     parser.add_argument("--batch-size", type=int, default=16, help='%(default)s')
     parser.add_argument("--destination", type=str, default="trained", help='%(default)s')
     parser.add_argument("--resume", type=str, default="", help="default is empty string '' ")
     parser.add_argument("--epoch", type=int, default=100, help='num epoch for training %(default)s')
+    parser.add_argument("--augmentation", type=parse_bool, default=True, help='augmentation: %(default)s')
+    parser.add_argument("--dev", type=parse_bool, default=False, help='development option: %(default)s')
     args = parser.parse_args()
     return args
 
 
+def resize(images):
+    input, answer = images
+    input = chainercv.transforms.resize(input, (240, 320))
+    answer = chainercv.transforms.resize(answer, (240, 320))
+
+    images = (input, answer)
+    return images
+
+
+DEG_RANGE = np.linspace(-20, 20, 100)
+
+
+def rotate_image(image, deg, expand=False):
+    return scipy.ndimage.rotate(image, deg, axes=(2, 1), reshape=expand)
+
+
+def transform(images):
+    input, answer = copy.deepcopy(images)
+
+    # rotate
+    deg = np.random.choice(DEG_RANGE)
+    input = rotate_image(input, deg)
+    answer = rotate_image(answer, deg)
+
+    # resize
+    H, W = input.shape[1:]
+    h_resize = int(np.random.uniform(240, H * 2.0))
+    w_resize = int(np.random.uniform(320, W * 2.0))
+    input = chainercv.transforms.resize(input, (h_resize, w_resize))
+    answer = chainercv.transforms.resize(answer, (h_resize, w_resize))
+
+    # crop
+    input, slice = transforms.random_crop(input, (240, 320), return_param=True)
+    answer = answer[:, slice["y_slice"], slice['x_slice']]
+
+    # flip
+    input, param = transforms.random_flip(input, x_random=True, return_param=True)
+    if param['x_flip']:
+        transforms.flip(answer, x_flip=True)
+
+    # pca_lighting:
+    input = transforms.pca_lighting(input, sigma=5)
+
+    return resize((input, answer))
 
 
 def train(args=None):
     if args.model_name == 'resnet50':
         model = RefinedNetwork(ResNet50)
-        resize = True
     elif args.model_name == 'unet':
         model = UNET()
-        resize = False
     else:
         assert False
 
-    dataset = DepthDataset('./', resize=resize, augmentation=True, pca_lighting=True, crop=True)
-    train, test = split_dataset_random(dataset, int(0.9 * len(dataset)), seed=args.seed)
+    if args.resume:
+        chainer.serializers.load_npz(args.resume, model)
+
+    dataset = DepthDataset('./', augmentation=args.augmentation, dev=args.dev)
+    size = len(dataset)
+    train, test = split_dataset_random(dataset, int(size * 0.95), seed=args.seed)
+    train = chainer.datasets.TransformDataset(train, transform)
+    test = chainer.datasets.TransformDataset(test, resize)
 
     train_iter = chainer.iterators.MultiprocessIterator(train, args.batch_size, n_processes=4)
     test_iter = chainer.iterators.MultiprocessIterator(
@@ -196,23 +263,17 @@ def train(args=None):
     opt.setup(model)
 
     updater = training.StandardUpdater(train_iter, opt, device=args.device)
-    trainer = training.Trainer(updater, (args.epoch, 'epoch'), out='./result')
+    trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.destination)
 
     snapshot_interval = (1, 'epoch')
     trainer.extend(extensions.Evaluator(test_iter, model,
                                         device=args.device), trigger=snapshot_interval)
-    trainer.extend(extensions.ProgressBar(), trigger=snapshot_interval)
+    trainer.extend(extensions.ProgressBar())
     trainer.extend(extensions.LogReport(trigger=snapshot_interval))
-    trainer.extend(extensions.snapshot(
-        filename='snapshot_epoch_{.updater.epoch}.npz'), trigger=snapshot_interval)
     trainer.extend(extensions.snapshot_object(
-        model, 'model_epoch_{.updater.epoch}.npz'), trigger=(10, 'epoch'))
+        model, 'model_epoch_{.updater.epoch}.npz'), trigger=(1, 'epoch'))
     trainer.extend(extensions.PrintReport(
         ["epoch", "main/loss", 'validation/main/loss']), trigger=snapshot_interval)
-
-    if args.resume:
-        chainer.serializers.load_npz(args.resume, trainer)
-
     trainer.run()
 
 
